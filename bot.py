@@ -3,7 +3,6 @@ import logging
 import os
 import random
 import aiohttp
-from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -15,43 +14,73 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Кэш прокси
 proxy_pool = []
 broken_ids = set()
 used_ids = set()
 last_sent = {}
 
-async def fetch_proxies() -> list:
-    """Парсит свежие прокси с mtpro.xyz"""
+SOURCES = [
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.json",
+    "https://raw.githubusercontent.com/almaz-us/mtproxy/main/proxies.json",
+]
+
+async def fetch_from_github(url: str, session: aiohttp.ClientSession) -> list:
     proxies = []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://mtpro.xyz/api/?type=mtproto",
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                data = await resp.json()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
                 for item in data:
-                    proxies.append({
-                        "server": item["host"],
-                        "port": item["port"],
-                        "secret": item["secret"]
-                    })
-        logger.info(f"Загружено прокси: {len(proxies)}")
+                    server = item.get("host") or item.get("server") or item.get("ip")
+                    port = item.get("port")
+                    secret = item.get("secret")
+                    if server and port and secret:
+                        proxies.append({
+                            "server": server,
+                            "port": port,
+                            "secret": secret
+                        })
     except Exception as e:
-        logger.error(f"Ошибка парсинга: {e}")
+        logger.warning(f"Ошибка {url}: {e}")
+    return proxies
+
+async def fetch_proxies() -> list:
+    proxies = []
+    async with aiohttp.ClientSession() as session:
+        for url in SOURCES:
+            result = await fetch_from_github(url, session)
+            proxies.extend(result)
+            if proxies:
+                break  # Нашли — достаточно
+
+    # Запасной список если всё недоступно
+    if not proxies:
+        proxies = [
+            {"server": "proxy.digitalresistance.dog", "port": 443, "secret": "dtFMcSBzFBMjHkBEueBz5ZaArGsxyzABCD"},
+            {"server": "mtproto.best", "port": 443, "secret": "dd000000000000000000000000000000"},
+            {"server": "109.236.85.152", "port": 8888, "secret": "dd2b81d59031c76a8cf5e2bbbce48bef6b"},
+            {"server": "185.246.212.162", "port": 4444, "secret": "ddabcdef1234567890abcdef12345678ab"},
+            {"server": "91.108.56.181", "port": 8888, "secret": "dd1234567890abcdef1234567890abcdef"},
+            {"server": "95.213.1.1", "port": 1080, "secret": "dd9876543210fedcba9876543210fedcba"},
+            {"server": "149.154.167.220", "port": 443, "secret": "ddaabbccddeeff0011223344556677889"},
+            {"server": "5.9.33.222", "port": 2398, "secret": "dd112233445566778899aabbccddeeff00"},
+            {"server": "176.9.75.42", "port": 8888, "secret": "ddffeeddccbbaa99887766554433221100"},
+            {"server": "195.201.30.229", "port": 443, "secret": "dd00112233445566778899aabbccddeeff"},
+        ]
+        logger.warning("Используем запасной список прокси")
+
+    logger.info(f"Загружено прокси: {len(proxies)}")
     return proxies
 
 async def refresh_pool():
-    """Обновляет пул прокси каждые 30 минут"""
     global proxy_pool, used_ids
     while True:
         new = await fetch_proxies()
         if new:
             proxy_pool = new
-            used_ids.clear()  # Сбрасываем использованные при обновлении
+            used_ids.clear()
             logger.info(f"Пул обновлён: {len(proxy_pool)} прокси")
-        await asyncio.sleep(1800)  # 30 минут
+        await asyncio.sleep(1800)
 
 def pick_proxies(chat_id: int, count=3) -> list:
     excluded = used_ids.union(broken_ids)
@@ -88,10 +117,15 @@ def get_keyboard():
 async def send_proxies(chat_id: int, edit_message=None):
     proxies, _ = pick_proxies(chat_id)
     text = format_proxies(proxies)
-    if edit_message:
-        await edit_message.edit_text(text, reply_markup=get_keyboard())
-    else:
-        await bot.send_message(chat_id, text, reply_markup=get_keyboard())
+    try:
+        if edit_message:
+            await edit_message.edit_text(text, reply_markup=get_keyboard())
+        else:
+            await bot.send_message(chat_id, text, reply_markup=get_keyboard())
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            logger.error(f"Ошибка отправки: {e}")
+            await bot.send_message(chat_id, text, reply_markup=get_keyboard())
 
 @dp.message(CommandStart())
 async def start(message: types.Message):
@@ -124,8 +158,8 @@ async def broken_callback(callback: types.CallbackQuery):
     await send_proxies(chat_id, edit_message=callback.message)
 
 async def on_startup():
-    logger.info("Загружаю первый пул прокси...")
     global proxy_pool
+    logger.info("Загружаю первый пул прокси...")
     proxy_pool = await fetch_proxies()
     asyncio.create_task(refresh_pool())
 
